@@ -4,6 +4,15 @@ A local, continuously listening Indonesian/English voice assistant with automati
 
 [`voice_assistant.py`](voice_assistant.py) is the canonical application and launcher. The Python client is independent of the hardware backend used by `whisper-server`: Metal, CUDA, Vulkan, and CPU builds expose the same HTTP API, so changing the whisper.cpp build does not require changes to the application.
 
+The source is split by responsibility while keeping that launch contract:
+
+| Path | Responsibility |
+| --- | --- |
+| `voice_assistant.py` | Audio devices, VAD and inference orchestration, conversation flow, and canonical `main()` |
+| `voice_client/config.py` | Proven defaults, environment variables, CLI validation, and immutable runtime configuration |
+| `voice_client/ui.py` | PySide6 signals, orb states, painting, dragging, and close behavior |
+| `tests/test_voice_assistant.py` | Hardware-free regression tests using mocked audio and HTTP transports |
+
 ## Architecture
 
 ```text
@@ -302,10 +311,18 @@ The focused regression suite covers VAD duration rounding, bounded capture behav
 
 ```bash
 uv run python -m unittest discover -s tests -v
-uv run python -m py_compile voice_assistant.py
+uv run python -m py_compile voice_assistant.py voice_client/*.py
 ```
 
 See [`TODO.md`](TODO.md) for the remaining improvement roadmap.
+
+## Contributing
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for setup, module boundaries, required checks, and pull-request guidance. GitHub issue forms are included for reproducible bug reports and portable feature requests. Do not attach model binaries, secrets, or private recordings.
+
+## License
+
+This project is open source under the [MIT License](LICENSE).
 
 ## Troubleshooting
 

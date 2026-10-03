@@ -16,6 +16,7 @@ from voice_assistant import (
     RequestCancelled,
     StreamingLanguageParser,
     VoiceAssistant,
+    find_audio_device,
     history_limit,
     milliseconds_to_chunks,
     stream_llm,
@@ -143,6 +144,80 @@ class AudioQueueTests(unittest.TestCase):
             assistant.audio_queue.get_nowait(),
             new_chunk[:, 0],
         )
+
+
+class AudioDeviceSelectionTests(unittest.TestCase):
+    devices = [
+        {
+            "name": "Built-in Microphone",
+            "max_input_channels": 1,
+            "max_output_channels": 0,
+        },
+        {
+            "name": "USB Audio Microphone",
+            "max_input_channels": 2,
+            "max_output_channels": 0,
+        },
+        {
+            "name": "USB Audio Speakers",
+            "max_input_channels": 0,
+            "max_output_channels": 2,
+        },
+    ]
+
+    def test_unique_partial_name_selects_matching_direction(self):
+        with patch(
+            "voice_assistant.sd.query_devices",
+            return_value=self.devices,
+        ):
+            self.assertEqual(
+                find_audio_device(
+                    "audio microphone",
+                    input_device=True,
+                ),
+                1,
+            )
+            self.assertEqual(
+                find_audio_device(
+                    "speakers",
+                    output_device=True,
+                ),
+                2,
+            )
+
+    def test_ambiguous_partial_name_reports_candidates(self):
+        duplicate_inputs = [
+            self.devices[0],
+            {
+                "name": "External Microphone",
+                "max_input_channels": 1,
+                "max_output_channels": 0,
+            },
+        ]
+
+        with patch(
+            "voice_assistant.sd.query_devices",
+            return_value=duplicate_inputs,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "matches multiple devices",
+            ):
+                find_audio_device(
+                    "microphone",
+                    input_device=True,
+                )
+
+    def test_numeric_device_must_support_requested_direction(self):
+        with patch(
+            "voice_assistant.sd.query_devices",
+            return_value=self.devices,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "not a valid input device",
+            ):
+                find_audio_device("2", input_device=True)
 
 
 class BackendClientTests(unittest.TestCase):
@@ -291,6 +366,117 @@ class BackendClientTests(unittest.TestCase):
             dtype="float32",
             samplerate=44100,
         )
+
+    def test_startup_rejects_unavailable_llm_model(self):
+        def handler(request):
+            if request.url.path == "/health":
+                return httpx.Response(
+                    200,
+                    json={"status": "ok"},
+                )
+
+            return httpx.Response(
+                200,
+                json={"data": [{"id": "another-model"}]},
+            )
+
+        with tempfile.NamedTemporaryFile() as model_file:
+            config = test_config(
+                silero_model=model_file.name
+            )
+
+            with (
+                patch(
+                    "voice_assistant.sd.check_input_settings"
+                ),
+                patch(
+                    "voice_assistant.sd.check_output_settings"
+                ),
+                httpx.Client(
+                    transport=httpx.MockTransport(handler)
+                ) as client,
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "Configured LLM model was not reported",
+                ),
+            ):
+                validate_startup(client, config, 3, 4)
+
+    def test_stream_ignores_invalid_sse_and_flushes_final_span(self):
+        def handler(_request):
+            return httpx.Response(
+                200,
+                headers={
+                    "content-type": "text/event-stream"
+                },
+                content=(
+                    b"event: message\n"
+                    b"data: not-json\n\n"
+                    b'data: {"choices":[{"delta":{"content":"<id>Halo"}}]}\n\n'
+                    b'data: {"choices":[{"delta":{"content":" dunia</id>"}}]}\n\n'
+                    b"data: [DONE]\n\n"
+                ),
+            )
+
+        spans = []
+        with httpx.Client(
+            transport=httpx.MockTransport(handler)
+        ) as client:
+            response, *_ = stream_llm(
+                client,
+                [{"role": "user", "content": "Hi"}],
+                test_config(),
+                on_span=spans.append,
+            )
+
+        self.assertEqual(response, "<id>Halo dunia</id>")
+        self.assertEqual(spans, [("id", "Halo dunia")])
+
+
+class StreamingTTSWorkerTests(unittest.TestCase):
+    class FakeTTS:
+        def __init__(self):
+            self.played = []
+
+        def synthesize(self, spans):
+            self.spans = spans
+            return np.ones(32, dtype=np.float32), 0.01, 0.25
+
+        def play(self, audio):
+            self.played.append(audio)
+
+    def test_worker_reports_speaking_then_thinking(self):
+        assistant = object.__new__(VoiceAssistant)
+        assistant.stop_event = threading.Event()
+        assistant.local_tts = self.FakeTTS()
+        states = []
+        assistant.set_state = states.append
+
+        span_queue = queue.Queue()
+        span_queue.put(("id", "Halo dunia."))
+        span_queue.put(None)
+        generation_done = threading.Event()
+        metrics = {
+            "synthesis_time": 0.0,
+            "audio_duration": 0.0,
+            "failed": False,
+            "finished": False,
+        }
+
+        assistant.stream_tts_worker(
+            span_queue,
+            generation_done,
+            metrics,
+        )
+
+        self.assertEqual(states, ["SPEAKING", "THINKING"])
+        self.assertEqual(
+            assistant.local_tts.spans,
+            [("id", "Halo dunia.")],
+        )
+        self.assertTrue(metrics["finished"])
+        self.assertFalse(metrics["failed"])
+        self.assertAlmostEqual(metrics["audio_duration"], 0.25)
 
 
 class StreamingLanguageParserTests(unittest.TestCase):

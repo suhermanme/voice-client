@@ -1,0 +1,42 @@
+name: Bug report
+description: Report a reproducible problem in the voice assistant
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What happened, and what did you expect instead?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction steps
+      placeholder: |
+        1. Start whisper-server with ...
+        2. Start the LLM backend with ...
+        3. Run voice_assistant.py with ...
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include OS, Python version, audio devices, whisper.cpp commit/backend, model filenames, and LLM backend/model.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Remove API keys, private addresses, and personal transcript content before posting.
+      render: shell
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I verified that no model binaries, secrets, or private recordings are attached.
+          required: true

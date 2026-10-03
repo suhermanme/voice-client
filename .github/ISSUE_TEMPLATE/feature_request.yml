@@ -1,0 +1,28 @@
+name: Feature request
+description: Propose an improvement to the local voice assistant
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: use_case
+    attributes:
+      label: Use case
+      description: Describe the user need and current limitation.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Explain the observable result, including any CLI or configuration changes.
+    validations:
+      required: true
+  - type: textarea
+    id: portability
+    attributes:
+      label: Backend and platform impact
+      description: Note any effects on macOS/Linux, Metal/CUDA/Vulkan/CPU, audio devices, or OpenAI-compatible backends.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered

@@ -13,9 +13,11 @@ This roadmap tracks the code-review findings for the canonical `voice_assistant.
 - [x] Make shutdown cancellation-aware. Signal active requests, close the shared HTTP client, stop audio playback, and wait for the voice worker to exit.
 - [x] Add structured runtime logging and a visible red `ERROR` orb state while preserving recovery on the next utterance.
 - [x] Stream complete language-tagged sentences to TTS while the remainder of the LLM response is still being generated.
+- [x] Split configuration/CLI concerns and the PySide6 orb into focused `voice_client` modules while retaining `voice_assistant.py` as the canonical launcher.
+- [x] Expand behavior-focused tests for device selection, language parsing, startup model validation, HTTP/SSE handling, cancellation, TTS state transitions, and conversation recovery.
+- [x] Add contribution guidance and structured GitHub bug/feature issue forms.
+- [x] Publish the project under the MIT License selected by the project owner.
 
 ## Next
 
-- [ ] Split implementation details into focused modules while keeping `voice_assistant.py` as the canonical launcher.
-- [ ] Expand tests for device selection, language parsing, endpoint state transitions, HTTP/SSE behavior, and failure recovery.
-- [ ] Add an explicit open-source license after the project owner chooses the license terms; optionally add contribution and issue templates.
+No review findings remain open. Add new entries here as the project evolves.

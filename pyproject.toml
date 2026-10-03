@@ -3,6 +3,7 @@ name = "voice-client"
 version = "0.1.0"
 description = "Local bilingual voice assistant with HTTP STT and LLM backends"
 readme = "README.md"
+license = "MIT"
 authors = [
     { name = "suhermanme", email = "edy.suherman@gmail.com" }
 ]
