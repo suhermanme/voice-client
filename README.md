@@ -10,13 +10,13 @@ A local, continuously listening Indonesian/English voice assistant with automati
 microphone -> Python Silero VAD -> utterance WAV in memory
            -> whisper.cpp HTTP server (STT)
            -> OpenAI-compatible chat-completions server (LLM)
-           -> Supertonic (local TTS) -> speaker
+           -> complete tagged sentences -> Supertonic (local TTS) -> speaker
 
                          PySide6 floating orb
-                  listening / hearing / thinking / speaking
+             listening / hearing / thinking / speaking / error
 ```
 
-The Python process captures mono 16 kHz audio in 512-sample blocks. Its ONNX Silero model detects the start and end of each utterance. The completed utterance is posted as an in-memory WAV to the persistent whisper.cpp server at `http://127.0.0.1:8081/inference`. The transcript and bounded conversation history are then streamed from an OpenAI-compatible chat-completions endpoint. Supertonic synthesizes the tagged Indonesian and English response locally at 44.1 kHz.
+The Python process captures mono 16 kHz audio in 512-sample blocks. Its ONNX Silero model detects the start and end of each utterance. The completed utterance is posted as an in-memory WAV to the persistent whisper.cpp server at `http://127.0.0.1:8081/inference`. The transcript and bounded conversation history are then streamed from an OpenAI-compatible chat-completions endpoint. As complete sentences arrive inside `<id>` or `<en>` spans, Supertonic begins local synthesis at 44.1 kHz instead of waiting for the whole response.
 
 Two VAD stages are intentional:
 
@@ -208,6 +208,8 @@ Start the STT and LLM servers first, then run the canonical launcher from the re
 uv run python voice_assistant.py
 ```
 
+Before opening the microphone, the launcher verifies the Python VAD model file, input and output audio formats, `whisper-server` health, and the configured model reported by the LLM backend's `/v1/models` route. A failed check is logged and leaves the orb red so the cause is visible. Closing the orb or pressing Ctrl-C signals active work to stop, closes the persistent HTTP client, stops audio playback, and waits briefly for the worker to exit.
+
 On macOS, grant microphone access to the terminal application when prompted.
 
 Audio device options:
@@ -239,6 +241,7 @@ CLI arguments take precedence over environment-backed defaults. The main setting
 | `VOICE_MIN_SPEECH_MS` | `--min-speech-ms` | `250` |
 | `VOICE_HTTP_TIMEOUT` | `--http-timeout` | `60` seconds |
 | `VOICE_MAX_HISTORY_MESSAGES` | `--max-history-messages` | `20` |
+| `VOICE_LOG_LEVEL` | `--log-level` | `INFO` |
 | `VOICE_MIC` | `--mic` | Preferred device, then system default |
 | `VOICE_SPEAKER` | `--speaker` | Preferred device, then system default |
 
@@ -261,6 +264,7 @@ uv run python voice_assistant.py
 | `HEARING` | Speech is currently being captured |
 | `THINKING` | Running STT, LLM generation, or TTS synthesis |
 | `SPEAKING` | Playing synthesized audio |
+| `ERROR` | Startup, STT, LLM, or TTS failed; inspect the terminal log |
 
 The orb stays above other windows and can be dragged. Close it or press Ctrl-C in the terminal for a clean shutdown.
 
@@ -268,7 +272,7 @@ The orb stays above other windows and can be dragged. Close it or press Ctrl-C i
 
 The system prompt is always retained. The client then keeps at most 20 conversation messages, approximately 10 user/assistant exchanges, in memory and sends them with each LLM request. Old complete exchanges are removed first. History exists only for the lifetime of the process and is never written to disk.
 
-The LLM response limit is 180 tokens with temperature `0.7` and top-p `0.8`. The system prompt asks for concise speech, selects Indonesian or English from the current turn, and uses `<id>...</id>` / `<en>...</en>` spans so Supertonic can pronounce code-switched output appropriately.
+The LLM response limit is 180 tokens with temperature `0.7` and top-p `0.8`. The system prompt asks for concise speech, selects Indonesian or English from the current turn, and uses `<id>...</id>` / `<en>...</en>` spans so Supertonic can pronounce code-switched output appropriately. Complete sentences are queued to TTS while later tokens are still arriving. The clean final response is added to memory only after generation succeeds; a failed or empty response restores the exact previous history.
 
 ## Reproducibility manifest
 
@@ -294,7 +298,7 @@ The Python dependency versions and package hashes are recorded in `uv.lock`; use
 
 ## Development checks
 
-The focused regression suite covers VAD duration rounding, bounded capture behavior, shared HTTP-client configuration, and transactional conversation recovery:
+The focused regression suite covers VAD duration rounding, bounded capture behavior, startup validation, request cancellation, streamed language-span parsing, shared HTTP-client configuration, and transactional conversation recovery:
 
 ```bash
 uv run python -m unittest discover -s tests -v
@@ -310,6 +314,8 @@ See [`TODO.md`](TODO.md) for the remaining improvement roadmap.
 **Connection refused on port 8081:** Start the persistent `whisper-server`, confirm it reports `127.0.0.1:8081`, and check that another process is not using the port.
 
 **LLM connection or model errors:** Confirm the configured machine is reachable, query `http://192.168.3.243:8080/v1/models`, and ensure its returned model ID accepts the `Qwen3-8B-Q5_K_M.gguf` value sent by the client. Change `VOICE_LLM_URL` and `VOICE_LLM_MODEL` together when using another backend.
+
+**The orb remains red:** Read the timestamped terminal error and traceback. At startup this usually identifies a missing VAD file, unsupported audio format, unhealthy Whisper server, unreachable LLM server, or a configured model absent from `/v1/models`. During operation it indicates an STT, LLM, or TTS failure; speaking again retries transient request failures.
 
 **No microphone or speaker is selected:** Run `--list-devices`, then pass a unique name fragment or numeric index with `--mic` and `--speaker`. Numeric indexes can change when USB or Bluetooth devices reconnect.
 

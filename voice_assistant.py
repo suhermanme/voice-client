@@ -3,6 +3,7 @@
 import argparse
 import io
 import json
+import logging
 import math
 import os
 import queue
@@ -24,6 +25,26 @@ from supertonic import TTS
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QPainter, QRadialGradient
 from PySide6.QtWidgets import QApplication, QWidget
+
+
+LOGGER = logging.getLogger("voice_client")
+
+
+class RequestCancelled(Exception):
+    pass
+
+
+def configure_logging(level):
+    logging.basicConfig(
+        level=getattr(
+            logging,
+            level.upper(),
+        ),
+        format=(
+            "%(asctime)s %(levelname)s "
+            "%(name)s: %(message)s"
+        ),
+    )
 
 
 # ============================================================================
@@ -271,6 +292,21 @@ def parse_args():
             str(MAX_HISTORY_MESSAGES),
         ),
         help="Maximum user/assistant messages retained.",
+    )
+
+    parser.add_argument(
+        "--log-level",
+        choices=(
+            "DEBUG",
+            "INFO",
+            "WARNING",
+            "ERROR",
+        ),
+        default=os.getenv(
+            "VOICE_LOG_LEVEL",
+            "INFO",
+        ).upper(),
+        help="Runtime logging level.",
     )
 
     return parser.parse_args()
@@ -958,6 +994,142 @@ def clean_response_for_display(text):
     return text.strip()
 
 
+OPEN_TAG_PATTERN = re.compile(
+    r"<(id|en)>",
+    re.IGNORECASE,
+)
+
+SENTENCE_PATTERN = re.compile(
+    r"\s*(.+?[.!?]+)(?=\s|$)",
+    re.DOTALL,
+)
+
+
+class StreamingLanguageParser:
+    def __init__(self):
+        self.buffer = ""
+        self.current_lang = None
+        self.saw_language_tag = False
+
+    def feed(self, text):
+        self.buffer += text
+        spans = []
+
+        while True:
+            if self.current_lang is None:
+                match = OPEN_TAG_PATTERN.search(
+                    self.buffer
+                )
+
+                if match is None:
+                    break
+
+                self.saw_language_tag = True
+                self.current_lang = (
+                    match.group(1).lower()
+                )
+                self.buffer = self.buffer[
+                    match.end():
+                ]
+
+            close_pattern = re.compile(
+                rf"</{self.current_lang}>",
+                re.IGNORECASE,
+            )
+            close_match = close_pattern.search(
+                self.buffer
+            )
+
+            if close_match is not None:
+                content = self.buffer[
+                    :close_match.start()
+                ]
+                spans.extend(
+                    self._complete_sentences(
+                        content,
+                        flush=True,
+                    )
+                )
+                self.buffer = self.buffer[
+                    close_match.end():
+                ]
+                self.current_lang = None
+                continue
+
+            spans.extend(
+                self._complete_sentences(
+                    self.buffer,
+                    flush=False,
+                )
+            )
+            break
+
+        return spans
+
+    def finish(self, raw_response):
+        spans = self.feed("")
+
+        if self.saw_language_tag:
+            if (
+                self.current_lang
+                and self.buffer.strip()
+            ):
+                spans.extend(
+                    self._complete_sentences(
+                        self.buffer,
+                        flush=True,
+                    )
+                )
+
+            self.buffer = ""
+            self.current_lang = None
+            return spans
+
+        self.buffer = ""
+        return parse_language_spans(
+            raw_response
+        )
+
+    def _complete_sentences(
+        self,
+        text,
+        *,
+        flush,
+    ):
+        if flush:
+            self.buffer = ""
+            candidates = [text]
+        else:
+            candidates = []
+            consumed = 0
+
+            for match in SENTENCE_PATTERN.finditer(
+                text
+            ):
+                candidates.append(
+                    match.group(1)
+                )
+                consumed = match.end()
+
+            self.buffer = text[consumed:]
+
+        spans = []
+
+        for content in candidates:
+            content = content.strip()
+
+            if not content:
+                continue
+
+            lang = normalize_tts_lang(
+                self.current_lang,
+                content,
+            )
+            spans.append((lang, content))
+
+        return spans
+
+
 # ============================================================================
 # Silero VAD
 # ============================================================================
@@ -1079,6 +1251,130 @@ def clear_audio_queue(
             break
 
 
+def sibling_url(url, sibling):
+    parsed = httpx.URL(url)
+    parent = parsed.path.rsplit("/", 1)[0]
+    path = f"{parent}/{sibling}"
+
+    return str(
+        parsed.copy_with(path=path)
+    )
+
+
+def llm_models_url(url):
+    parsed = httpx.URL(url)
+    marker = "/chat/completions"
+
+    if parsed.path.endswith(marker):
+        path = (
+            parsed.path[:-len(marker)]
+            + "/models"
+        )
+    else:
+        path = "/v1/models"
+
+    return str(
+        parsed.copy_with(path=path)
+    )
+
+
+def validate_startup(
+    client,
+    config,
+    mic_device,
+    speaker_device,
+):
+    model_path = Path(
+        config.silero_model
+    )
+
+    if not model_path.is_file():
+        raise RuntimeError(
+            "Python Silero VAD model not found: "
+            f"{model_path}"
+        )
+
+    sd.check_input_settings(
+        device=mic_device,
+        channels=1,
+        dtype="float32",
+        samplerate=SAMPLE_RATE,
+    )
+    sd.check_output_settings(
+        device=speaker_device,
+        channels=1,
+        dtype="float32",
+        samplerate=TTS_SAMPLE_RATE,
+    )
+
+    whisper_health_url = sibling_url(
+        config.whisper_url,
+        "health",
+    )
+    response = client.get(
+        whisper_health_url
+    )
+    response.raise_for_status()
+
+    health = response.json()
+
+    if health.get("status") != "ok":
+        raise RuntimeError(
+            "whisper-server is not ready: "
+            f"{health}"
+        )
+
+    models_url = llm_models_url(
+        config.llm_url
+    )
+    headers = {}
+
+    if config.llm_api_key:
+        headers["Authorization"] = (
+            f"Bearer {config.llm_api_key}"
+        )
+
+    response = client.get(
+        models_url,
+        headers=headers,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    model_ids = [
+        str(item.get("id", ""))
+        for item in payload.get("data", [])
+        if item.get("id")
+    ]
+
+    configured_name = Path(
+        config.llm_model
+    ).name
+    accepted = any(
+        model_id == config.llm_model
+        or Path(model_id).name
+        == configured_name
+        for model_id in model_ids
+    )
+
+    if not model_ids:
+        raise RuntimeError(
+            "LLM backend returned no model IDs from "
+            f"{models_url}"
+        )
+
+    if not accepted:
+        raise RuntimeError(
+            "Configured LLM model was not reported by "
+            f"{models_url}: {config.llm_model}; "
+            f"available: {', '.join(model_ids)}"
+        )
+
+    LOGGER.info(
+        "Startup validation passed: VAD model, audio devices, "
+        "whisper-server, and LLM backend are ready"
+    )
+
+
 # ============================================================================
 # Whisper STT
 # ============================================================================
@@ -1087,7 +1383,11 @@ def transcribe(
     client,
     samples,
     config,
+    stop_event=None,
 ):
+    if stop_event and stop_event.is_set():
+        raise RequestCancelled()
+
     audio = wav_bytes(
         samples
     )
@@ -1115,6 +1415,9 @@ def transcribe(
 
     response.raise_for_status()
 
+    if stop_event and stop_event.is_set():
+        raise RequestCancelled()
+
     text = (
         response
         .json()["text"]
@@ -1140,6 +1443,8 @@ def stream_llm(
     client,
     messages,
     config,
+    on_span=None,
+    stop_event=None,
 ):
     payload = {
         "model": config.llm_model,
@@ -1158,6 +1463,7 @@ def stream_llm(
     first_token_at = None
 
     pieces = []
+    parser = StreamingLanguageParser()
 
     headers = {}
 
@@ -1175,6 +1481,9 @@ def stream_llm(
         response.raise_for_status()
 
         for line in response.iter_lines():
+            if stop_event and stop_event.is_set():
+                raise RequestCancelled()
+
             if not line.startswith(
                 "data: "
             ):
@@ -1228,6 +1537,12 @@ def stream_llm(
                 content
             )
 
+            if on_span:
+                for span in parser.feed(
+                    content
+                ):
+                    on_span(span)
+
     total = (
         time.perf_counter()
         - start
@@ -1238,6 +1553,12 @@ def stream_llm(
             pieces
         ).strip()
     )
+
+    if on_span:
+        for span in parser.finish(
+            raw_response
+        ):
+            on_span(span)
 
     return (
         raw_response,
@@ -1260,10 +1581,7 @@ class LocalTTS:
             speaker_device
         )
 
-        print(
-            "Loading Supertonic TTS...",
-            flush=True,
-        )
+        LOGGER.info("Loading Supertonic TTS...")
 
         start = (
             time.perf_counter()
@@ -1285,10 +1603,9 @@ class LocalTTS:
             - start
         )
 
-        print(
-            f"Supertonic ready in "
-            f"{elapsed:.2f} s.\n",
-            flush=True,
+        LOGGER.info(
+            "Supertonic ready in %.2f s",
+            elapsed,
         )
 
     def synthesize(
@@ -1384,7 +1701,10 @@ class LocalTTS:
         try:
             sd.stop()
         except Exception:
-            pass
+            LOGGER.debug(
+                "TTS audio stop failed",
+                exc_info=True,
+            )
 
 
 # ============================================================================
@@ -1461,6 +1781,7 @@ class Orb(QWidget):
             "HEARING",
             "THINKING",
             "SPEAKING",
+            "ERROR",
         }:
             self.state = state
             self.update()
@@ -1472,6 +1793,7 @@ class Orb(QWidget):
             "HEARING": 0.085,
             "THINKING": 0.075,
             "SPEAKING": 0.120,
+            "ERROR": 0.030,
         }
 
         self.phase += speeds.get(
@@ -1554,13 +1876,24 @@ class Orb(QWidget):
             )
             base_radius = 43
 
-        else:
+        elif (
+            self.state
+            == "SPEAKING"
+        ):
             color = QColor(
                 70,
                 245,
                 180,
             )
             base_radius = 46
+
+        else:
+            color = QColor(
+                255,
+                70,
+                85,
+            )
+            base_radius = 44
 
         radius = (
             base_radius
@@ -1761,9 +2094,8 @@ class Orb(QWidget):
         self,
         event,
     ):
-        print(
-            "\nOrb closed. "
-            "Stopping voice assistant..."
+        LOGGER.info(
+            "Orb closed; stopping voice assistant"
         )
 
         self.stop_event.set()
@@ -1824,12 +2156,13 @@ class VoiceAssistant:
             threading.Event()
         )
 
-        self.vad = SileroVAD(
-            self.config.silero_model
-        )
+        self.vad = None
 
         self.local_tts = None
         self.http_client = None
+        self.http_client_lock = (
+            threading.Lock()
+        )
 
         self.history = (
             ConversationHistory(
@@ -1863,10 +2196,9 @@ class VoiceAssistant:
         status,
     ):
         if status:
-            print(
-                f"\nAudio status: "
-                f"{status}",
-                flush=True,
+            LOGGER.warning(
+                "Audio callback status: %s",
+                status,
             )
 
         if (
@@ -1897,43 +2229,156 @@ class VoiceAssistant:
                 pass
 
     def run(self):
+        fatal_error = False
+
         try:
             self._run()
 
+        except RequestCancelled:
+            LOGGER.info(
+                "Voice assistant request cancelled"
+            )
+
         except Exception as exc:
-            print(
-                "\nVoice assistant "
-                "fatal error: "
-                f"{exc}"
+            fatal_error = True
+            self.set_state("ERROR")
+            LOGGER.exception(
+                "Voice assistant fatal error: %s",
+                exc,
             )
 
         finally:
             self.capture_enabled.clear()
-
-            if self.http_client:
-                self.http_client.close()
+            self.close_http_client()
 
             if self.local_tts:
                 self.local_tts.stop()
 
-            self.set_state(
-                "IDLE"
-            )
-
             self.stop_event.set()
 
-            (
-                self.signals
-                .shutdown_requested
-                .emit()
+            if not fatal_error:
+                self.set_state(
+                    "IDLE"
+                )
+
+                (
+                    self.signals
+                    .shutdown_requested
+                    .emit()
+                )
+
+    def close_http_client(self):
+        with self.http_client_lock:
+            client = self.http_client
+            self.http_client = None
+
+        if client is None:
+            return
+
+        try:
+            client.close()
+        except Exception:
+            LOGGER.debug(
+                "HTTP client close failed",
+                exc_info=True,
             )
 
+    def stop(self):
+        self.stop_event.set()
+        self.capture_enabled.clear()
+        self.close_http_client()
+
+        try:
+            sd.stop()
+        except Exception:
+            LOGGER.debug(
+                "Audio stop failed",
+                exc_info=True,
+            )
+
+    def stream_tts_worker(
+        self,
+        span_queue,
+        generation_done,
+        metrics,
+    ):
+        while not self.stop_event.is_set():
+            span = span_queue.get()
+
+            if span is None:
+                break
+
+            LOGGER.info(
+                "TTS span (%s): %s",
+                span[0],
+                span[1],
+            )
+
+            try:
+                (
+                    speech_audio,
+                    tts_time,
+                    speech_duration,
+                ) = self.local_tts.synthesize(
+                    [span]
+                )
+
+                if self.stop_event.is_set():
+                    break
+
+                metrics["synthesis_time"] += (
+                    tts_time
+                )
+                metrics["audio_duration"] += (
+                    speech_duration
+                )
+
+                if speech_audio is None:
+                    continue
+
+                self.set_state("SPEAKING")
+                self.local_tts.play(
+                    speech_audio
+                )
+
+                if (
+                    not self.stop_event.is_set()
+                    and not generation_done.is_set()
+                ):
+                    self.set_state("THINKING")
+
+            except Exception:
+                metrics["failed"] = True
+                self.set_state("ERROR")
+                LOGGER.exception(
+                    "Streaming TTS failed"
+                )
+
+        metrics["finished"] = True
+
     def _run(self):
-        self.http_client = httpx.Client(
+        client = httpx.Client(
             timeout=(
                 self.config
                 .http_timeout_seconds
             )
+        )
+
+        with self.http_client_lock:
+            self.http_client = client
+
+        validate_startup(
+            client,
+            self.config,
+            self.mic_device,
+            self.speaker_device,
+        )
+
+        if self.stop_event.is_set():
+            raise RequestCancelled()
+
+        self.vad = SileroVAD(
+            self.config.silero_model
         )
 
         self.local_tts = (
@@ -1941,6 +2386,9 @@ class VoiceAssistant:
                 self.speaker_device
             )
         )
+
+        if self.stop_event.is_set():
+            raise RequestCancelled()
 
         pre_roll_chunks = milliseconds_to_chunks(
             self.config.pre_roll_ms
@@ -1961,21 +2409,18 @@ class VoiceAssistant:
         silence_chunks = 0
         speech_chunks = 0
 
-        print(
-            "Listening continuously. "
-            "Ctrl-C or close the orb to quit."
+        LOGGER.info(
+            "Listening continuously; Ctrl-C or close the orb to quit"
         )
 
-        print(
+        LOGGER.info(
             "Conversation memory: "
             f"up to approximately "
             f"{self.config.max_history_messages // 2} "
-            "user/assistant exchanges."
+            "user/assistant exchanges"
         )
 
-        print(
-            "Speak naturally when ready.\n"
-        )
+        LOGGER.info("Speak naturally when ready")
 
         self.set_state(
             "LISTENING"
@@ -2048,10 +2493,7 @@ class VoiceAssistant:
                             "HEARING"
                         )
 
-                        print(
-                            "Speech detected...",
-                            flush=True,
-                        )
+                        LOGGER.info("Speech detected")
 
                     continue
 
@@ -2099,36 +2541,40 @@ class VoiceAssistant:
                         )
                     )
 
-                    print(
-                        "End of speech detected."
-                    )
+                    LOGGER.info("End of speech detected")
 
                     self.set_state(
                         "THINKING"
                     )
 
-                    print(
-                        "Transcribing..."
-                    )
+                    LOGGER.info("Transcribing")
 
                     # --------------------------------------------------------
                     # STT
                     # --------------------------------------------------------
+
+                    stt_failed = False
 
                     try:
                         (
                             user_text,
                             stt_time,
                         ) = transcribe(
-                            self.http_client,
+                            client,
                             samples,
                             self.config,
+                            self.stop_event,
                         )
 
+                    except RequestCancelled:
+                        break
+
                     except Exception as exc:
-                        print(
-                            f"STT error: "
-                            f"{exc}"
+                        stt_failed = True
+                        self.set_state("ERROR")
+                        LOGGER.exception(
+                            "STT request failed: %s",
+                            exc,
                         )
 
                         user_text = ""
@@ -2141,14 +2587,10 @@ class VoiceAssistant:
                         break
 
                     if user_text:
-                        print(
-                            f'You: '
-                            f'"{user_text}"'
-                        )
-
-                        print(
-                            f"STT latency: "
-                            f"{stt_time * 1000:.0f} ms"
+                        LOGGER.info("You: %s", user_text)
+                        LOGGER.info(
+                            "STT latency: %.0f ms",
+                            stt_time * 1000,
                         )
 
                         # ----------------------------------------------------
@@ -2163,15 +2605,42 @@ class VoiceAssistant:
                             user_text
                         )
 
-                        print(
-                            "Conversation context: "
-                            f"{self.history.approximate_turn_count} "
-                            "stored exchange(s)"
+                        LOGGER.info(
+                            "Conversation context: %d stored exchange(s)",
+                            self.history.approximate_turn_count,
                         )
 
                         # ----------------------------------------------------
                         # LLM
                         # ----------------------------------------------------
+
+                        span_queue = queue.Queue()
+                        generation_done = (
+                            threading.Event()
+                        )
+                        tts_metrics = {
+                            "synthesis_time": 0.0,
+                            "audio_duration": 0.0,
+                            "failed": False,
+                            "finished": False,
+                        }
+                        tts_thread = threading.Thread(
+                            target=self.stream_tts_worker,
+                            args=(
+                                span_queue,
+                                generation_done,
+                                tts_metrics,
+                            ),
+                            name="streaming-tts",
+                            daemon=True,
+                        )
+                        tts_thread.start()
+                        request_cancelled = False
+                        llm_failed = False
+
+                        def queue_tts_span(span):
+                            if not self.stop_event.is_set():
+                                span_queue.put(span)
 
                         try:
                             (
@@ -2180,27 +2649,45 @@ class VoiceAssistant:
                                 first_token_at,
                                 llm_total,
                             ) = stream_llm(
-                                self.http_client,
+                                client,
                                 self.history
                                 .get_messages(),
                                 self.config,
+                                on_span=queue_tts_span,
+                                stop_event=self.stop_event,
                             )
 
+                        except RequestCancelled:
+                            request_cancelled = True
+                            raw_response = ""
+                            llm_ttft = None
+                            first_token_at = None
+                            llm_total = 0.0
+
                         except Exception as exc:
-                            print(
-                                f"LLM error: "
-                                f"{exc}"
-                            )
+                            if self.stop_event.is_set():
+                                request_cancelled = True
+                            else:
+                                llm_failed = True
+                                self.set_state("ERROR")
+                                LOGGER.exception(
+                                    "LLM request failed: %s",
+                                    exc,
+                                )
 
                             raw_response = ""
                             llm_ttft = None
                             first_token_at = None
                             llm_total = 0.0
 
+                        finally:
+                            generation_done.set()
+                            span_queue.put(None)
+                            tts_thread.join()
+
                         if (
-                            self
-                            .stop_event
-                            .is_set()
+                            request_cancelled
+                            or self.stop_event.is_set()
                         ):
                             break
 
@@ -2216,9 +2703,9 @@ class VoiceAssistant:
                                 clean_response
                             )
 
-                            print(
-                                f"\nAssistant: "
-                                f"{clean_response}"
+                            LOGGER.info(
+                                "Assistant: %s",
+                                clean_response,
                             )
 
                             if (
@@ -2232,133 +2719,57 @@ class VoiceAssistant:
                                     - endpoint_detected
                                 )
 
-                                print(
-                                    f"\nLLM TTFT: "
-                                    f"{llm_ttft * 1000:.0f} ms"
+                                LOGGER.info(
+                                    "LLM TTFT: %.0f ms",
+                                    llm_ttft * 1000,
                                 )
 
-                                print(
-                                    "Endpoint → first-token: "
-                                    f"{endpoint_to_first * 1000:.0f} ms"
+                                LOGGER.info(
+                                    "Endpoint to first token: %.0f ms",
+                                    endpoint_to_first * 1000,
                                 )
 
-                            print(
-                                f"LLM total: "
-                                f"{llm_total:.2f} s"
+                            LOGGER.info(
+                                "LLM generation: %.2f s",
+                                llm_total,
                             )
 
-                            print(
-                                "Conversation memory: "
-                                f"{self.history.approximate_turn_count} "
-                                "exchange(s)"
+                            LOGGER.info(
+                                "Conversation memory: %d exchange(s)",
+                                self.history.approximate_turn_count,
                             )
 
-                            # ------------------------------------------------
-                            # TTS
-                            # ------------------------------------------------
-
-                            spans = (
-                                parse_language_spans(
-                                    raw_response
-                                )
+                            LOGGER.info(
+                                "TTS synthesis: %.0f ms for %.2f s audio",
+                                tts_metrics["synthesis_time"] * 1000,
+                                tts_metrics["audio_duration"],
                             )
-
-                            print(
-                                "TTS spans:",
-                                spans,
-                            )
-
-                            try:
-                                (
-                                    speech_audio,
-                                    tts_time,
-                                    speech_duration,
-                                ) = (
-                                    self
-                                    .local_tts
-                                    .synthesize(
-                                        spans
-                                    )
-                                )
-
-                                if (
-                                    self
-                                    .stop_event
-                                    .is_set()
-                                ):
-                                    break
-
-                                print(
-                                    f"TTS synthesis: "
-                                    f"{tts_time * 1000:.0f} ms "
-                                    f"for "
-                                    f"{speech_duration:.2f} s audio"
-                                )
-
-                                self.set_state(
-                                    "SPEAKING"
-                                )
-
-                                print(
-                                    "Speaking...",
-                                    flush=True,
-                                )
-
-                                (
-                                    self
-                                    .local_tts
-                                    .play(
-                                        speech_audio
-                                    )
-                                )
-
-                                if (
-                                    self
-                                    .stop_event
-                                    .is_set()
-                                ):
-                                    break
-
-                                self.set_state(
-                                    "LISTENING"
-                                )
-
-                                print(
-                                    "Listening again.\n",
-                                    flush=True,
-                                )
-
-                            except Exception as exc:
-                                print(
-                                    f"TTS error: "
-                                    f"{exc}"
-                                )
-
-                                self.set_state(
-                                    "LISTENING"
-                                )
+                            if tts_metrics["failed"]:
+                                self.set_state("ERROR")
+                            else:
+                                self.set_state("LISTENING")
 
                         else:
                             self.history.restore(
                                 history_before_user
                             )
 
-                            print(
-                                "No LLM response."
+                            LOGGER.warning(
+                                "LLM returned no response"
                             )
 
+                            if not llm_failed:
+                                self.set_state(
+                                    "LISTENING"
+                                )
+
+                    else:
+                        LOGGER.info("No speech recognized")
+
+                        if not stt_failed:
                             self.set_state(
                                 "LISTENING"
                             )
-
-                    else:
-                        print(
-                            "No speech recognized."
-                        )
-
-                        self.set_state(
-                            "LISTENING"
-                        )
 
                 # ============================================================
                 # Reset only audio/VAD state.
@@ -2381,9 +2792,7 @@ class VoiceAssistant:
                 if not self.stop_event.is_set():
                     self.capture_enabled.set()
 
-        print(
-            "\nVoice loop stopped."
-        )
+        LOGGER.info("Voice loop stopped")
 
 
 # ============================================================================
@@ -2392,6 +2801,7 @@ class VoiceAssistant:
 
 def main():
     args = parse_args()
+    configure_logging(args.log_level)
     config = config_from_args(
         args
     )
@@ -2426,10 +2836,7 @@ def main():
         )
 
     except RuntimeError as exc:
-        print(
-            f"\nAudio configuration error: "
-            f"{exc}"
-        )
+        LOGGER.error("Audio configuration error: %s", exc)
 
         list_audio_devices()
 
@@ -2447,23 +2854,16 @@ def main():
         )
     )
 
-    print(
-        "\nAudio configuration:"
+    LOGGER.info(
+        "Audio input: %s - %s",
+        mic_device,
+        mic_info["name"],
     )
-
-    print(
-        f"  Microphone: "
-        f"{mic_device} - "
-        f"{mic_info['name']}"
+    LOGGER.info(
+        "Audio output: %s - %s",
+        speaker_device,
+        speaker_info["name"],
     )
-
-    print(
-        f"  Speaker:    "
-        f"{speaker_device} - "
-        f"{speaker_info['name']}"
-    )
-
-    print()
 
     # ------------------------------------------------------------------------
     # Qt application
@@ -2551,16 +2951,9 @@ def main():
             not stop_event
             .is_set()
         ):
-            print(
-                "\nStopping assistant..."
-            )
+            LOGGER.info("Stopping assistant")
 
-        stop_event.set()
-
-        try:
-            sd.stop()
-        except Exception:
-            pass
+        assistant.stop()
 
         app.quit()
 
@@ -2589,7 +2982,7 @@ def main():
     )
 
     app.aboutToQuit.connect(
-        stop_event.set
+        assistant.stop
     )
 
     # ------------------------------------------------------------------------
@@ -2602,20 +2995,18 @@ def main():
         app.exec()
     )
 
-    stop_event.set()
-
-    try:
-        sd.stop()
-    except Exception:
-        pass
+    assistant.stop()
 
     worker.join(
-        timeout=2.0
+        timeout=5.0
     )
 
-    print(
-        "Stopped."
-    )
+    if worker.is_alive():
+        LOGGER.warning(
+            "Voice worker did not exit within 5 seconds"
+        )
+    else:
+        LOGGER.info("Stopped")
 
     sys.exit(
         exit_code

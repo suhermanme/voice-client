@@ -1,8 +1,10 @@
 import argparse
 import json
 import queue
+import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 
 import httpx
 import numpy as np
@@ -11,12 +13,35 @@ from voice_assistant import (
     AppConfig,
     CHUNK,
     ConversationHistory,
+    RequestCancelled,
+    StreamingLanguageParser,
     VoiceAssistant,
     history_limit,
     milliseconds_to_chunks,
     stream_llm,
     transcribe,
+    validate_startup,
 )
+
+
+def test_config(**overrides):
+    values = {
+        "whisper_url": "http://stt.test/inference",
+        "llm_url": "http://llm.test/v1/chat/completions",
+        "llm_model": "test-model",
+        "llm_api_key": "secret",
+        "silero_model": "unused.onnx",
+        "vad_threshold": 0.6,
+        "end_silence_ms": 650,
+        "pre_roll_ms": 250,
+        "min_speech_ms": 250,
+        "http_timeout_seconds": 60,
+        "max_history_messages": 20,
+        "preferred_mic": "mic",
+        "preferred_speaker": "speaker",
+    }
+    values.update(overrides)
+    return AppConfig(**values)
 
 
 class DurationConversionTests(unittest.TestCase):
@@ -156,21 +181,8 @@ class BackendClientTests(unittest.TestCase):
                 ),
             )
 
-        config = AppConfig(
-            whisper_url="http://stt.test/inference",
-            llm_url="http://llm.test/v1/chat/completions",
-            llm_model="test-model",
-            llm_api_key="secret",
-            silero_model="unused.onnx",
-            vad_threshold=0.6,
-            end_silence_ms=650,
-            pre_roll_ms=250,
-            min_speech_ms=250,
-            http_timeout_seconds=60,
-            max_history_messages=20,
-            preferred_mic="mic",
-            preferred_speaker="speaker",
-        )
+        config = test_config()
+        spans = []
 
         with httpx.Client(
             transport=httpx.MockTransport(
@@ -186,13 +198,128 @@ class BackendClientTests(unittest.TestCase):
                 client,
                 [{"role": "user", "content": "Hi"}],
                 config,
+                on_span=spans.append,
             )
 
         self.assertEqual(transcript, "hello")
         self.assertEqual(response, "<en>Hello</en>")
+        self.assertEqual(spans, [("en", "Hello")])
         self.assertEqual(
             [request.url.host for request in requests],
             ["stt.test", "llm.test"],
+        )
+
+    def test_transcription_honors_cancellation_before_request(self):
+        stop_event = threading.Event()
+        stop_event.set()
+
+        def handler(_request):
+            self.fail("cancelled request reached the backend")
+
+        with httpx.Client(
+            transport=httpx.MockTransport(handler)
+        ) as client:
+            with self.assertRaises(RequestCancelled):
+                transcribe(
+                    client,
+                    np.zeros(CHUNK, dtype=np.float32),
+                    test_config(),
+                    stop_event,
+                )
+
+    def test_startup_validation_checks_services_and_audio(self):
+        requested_paths = []
+
+        def handler(request):
+            requested_paths.append(request.url.path)
+
+            if request.url.path == "/health":
+                return httpx.Response(
+                    200,
+                    json={"status": "ok"},
+                )
+
+            self.assertEqual(
+                request.headers["Authorization"],
+                "Bearer secret",
+            )
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {"id": "/models/test-model"}
+                    ]
+                },
+            )
+
+        with tempfile.NamedTemporaryFile() as model_file:
+            config = test_config(
+                silero_model=model_file.name
+            )
+
+            with (
+                patch(
+                    "voice_assistant.sd.check_input_settings"
+                ) as check_input,
+                patch(
+                    "voice_assistant.sd.check_output_settings"
+                ) as check_output,
+                httpx.Client(
+                    transport=httpx.MockTransport(handler)
+                ) as client,
+            ):
+                validate_startup(
+                    client,
+                    config,
+                    3,
+                    4,
+                )
+
+        self.assertEqual(
+            requested_paths,
+            ["/health", "/v1/models"],
+        )
+        check_input.assert_called_once_with(
+            device=3,
+            channels=1,
+            dtype="float32",
+            samplerate=16000,
+        )
+        check_output.assert_called_once_with(
+            device=4,
+            channels=1,
+            dtype="float32",
+            samplerate=44100,
+        )
+
+
+class StreamingLanguageParserTests(unittest.TestCase):
+    def test_emits_complete_sentences_before_tag_closes(self):
+        parser = StreamingLanguageParser()
+
+        self.assertEqual(parser.feed("<e"), [])
+        self.assertEqual(
+            parser.feed("n>Hello. Next"),
+            [("en", "Hello.")],
+        )
+        self.assertEqual(
+            parser.feed(" sentence!</en>"),
+            [("en", "Next sentence!")],
+        )
+        self.assertEqual(
+            parser.finish(
+                "<en>Hello. Next sentence!</en>"
+            ),
+            [],
+        )
+
+    def test_falls_back_when_response_has_no_language_tags(self):
+        parser = StreamingLanguageParser()
+        parser.feed("Hello from the local server.")
+
+        self.assertEqual(
+            parser.finish("Hello from the local server."),
+            [("en", "Hello from the local server.")],
         )
 
 
