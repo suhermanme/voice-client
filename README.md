@@ -31,7 +31,7 @@ The currently proven profile is:
 | --- | --- | --- |
 | STT | whisper.cpp commit `60c0be6a`; `ggml-small.bin` (~487 MB) | Auto language detection; persistent server on `127.0.0.1:8081` |
 | whisper.cpp VAD | `ggml-silero-v6.2.0.bin` (~0.88 MB) | Threshold `0.60`; minimum speech `250 ms`; minimum/end silence `650 ms`; speech padding `120 ms` |
-| Python live VAD | `models/silero_vad.onnx` | Threshold `0.60`; minimum speech `250 ms`; end silence `650 ms`; pre-roll `250 ms`; ONNX Runtime CPU provider |
+| Python live VAD | `models/silero_vad.onnx` | Threshold `0.60`; configured minimum speech `250 ms`; configured end silence `650 ms`; configured pre-roll `250 ms`; ONNX Runtime CPU provider |
 | LLM | `Qwen3-8B-Q5_K_M.gguf` via llama.cpp | OpenAI-compatible endpoint `http://192.168.3.243:8080/v1/chat/completions`; context `16384`; full GPU offload where supported; reasoning disabled |
 | TTS | Supertonic voice `F1` | Local synthesis; Indonesian and English language spans |
 
@@ -42,6 +42,8 @@ Bahasa Indonesia and English mixed conversation. GPU, VRAM, CPU, Docker, Proxmox
 ```
 
 The client sends `language=auto`, that prompt, and `carry_initial_prompt=true` with every transcription request.
+
+Live audio arrives in 512-sample chunks, or 32 ms at 16 kHz. Duration thresholds round upward to complete chunks so they are never shorter than configured: the default 250 ms minimum speech and pre-roll use 256 ms, while 650 ms end silence uses 672 ms.
 
 ## Prerequisites
 
@@ -196,7 +198,7 @@ The exact llama.cpp commit and original launch command used by that machine have
 
 Check `llama-server --help` for the installed version before copying the command; reasoning controls have changed between llama.cpp revisions. The server should return the configured model ID from `GET /v1/models` and accept streamed `POST /v1/chat/completions` requests.
 
-Any local backend that implements the OpenAI-compatible streaming chat-completions route can replace llama.cpp. Change `LLM_URL` and `LLM_MODEL` in the configuration section near the top of `voice_assistant.py`; no audio, VAD, UI, or TTS code depends on llama.cpp. Likewise, `WHISPER_URL` can point to a compatible whisper-server on another machine.
+Any local backend that implements the OpenAI-compatible streaming chat-completions route can replace llama.cpp. Set `VOICE_LLM_URL` and `VOICE_LLM_MODEL`, or pass the matching CLI options; no audio, VAD, UI, or TTS code depends on llama.cpp. The Whisper URL is configurable in the same way.
 
 ## Run the assistant
 
@@ -220,6 +222,35 @@ uv run python voice_assistant.py --mic 2 --speaker 4
 ```
 
 Without overrides, the app first looks for `MacBook Pro Microphone` and `MacBook Pro Speakers`, then falls back to the system defaults. No Core Audio device index is hard-coded.
+
+### Runtime configuration
+
+CLI arguments take precedence over environment-backed defaults. The main settings are:
+
+| Environment variable | CLI option | Proven default |
+| --- | --- | --- |
+| `VOICE_WHISPER_URL` | `--whisper-url` | `http://127.0.0.1:8081/inference` |
+| `VOICE_LLM_URL` | `--llm-url` | `http://192.168.3.243:8080/v1/chat/completions` |
+| `VOICE_LLM_MODEL` | `--llm-model` | `Qwen3-8B-Q5_K_M.gguf` |
+| `VOICE_VAD_MODEL` | `--vad-model` | Repository-local `models/silero_vad.onnx` |
+| `VOICE_VAD_THRESHOLD` | `--vad-threshold` | `0.60` |
+| `VOICE_END_SILENCE_MS` | `--end-silence-ms` | `650` |
+| `VOICE_PRE_ROLL_MS` | `--pre-roll-ms` | `250` |
+| `VOICE_MIN_SPEECH_MS` | `--min-speech-ms` | `250` |
+| `VOICE_HTTP_TIMEOUT` | `--http-timeout` | `60` seconds |
+| `VOICE_MAX_HISTORY_MESSAGES` | `--max-history-messages` | `20` |
+| `VOICE_MIC` | `--mic` | Preferred device, then system default |
+| `VOICE_SPEAKER` | `--speaker` | Preferred device, then system default |
+
+`VOICE_LLM_API_KEY` adds a bearer token to LLM requests and is intentionally environment-only so it does not need to appear in a command line. `VOICE_PREFERRED_MIC` and `VOICE_PREFERRED_SPEAKER` change the preferred-device fallback names.
+
+For example:
+
+```bash
+VOICE_LLM_URL=http://127.0.0.1:8000/v1/chat/completions \
+VOICE_LLM_MODEL=my-local-model \
+uv run python voice_assistant.py
+```
 
 ## Orb states and interaction
 
@@ -261,13 +292,24 @@ shasum -a 256 /path/to/model-file
 
 The Python dependency versions and package hashes are recorded in `uv.lock`; use `uv sync --frozen` rather than resolving a new environment.
 
+## Development checks
+
+The focused regression suite covers VAD duration rounding, bounded capture behavior, shared HTTP-client configuration, and transactional conversation recovery:
+
+```bash
+uv run python -m unittest discover -s tests -v
+uv run python -m py_compile voice_assistant.py
+```
+
+See [`TODO.md`](TODO.md) for the remaining improvement roadmap.
+
 ## Troubleshooting
 
-**`models/silero_vad.onnx` cannot be opened:** Run the pinned download command from the repository root and verify its checksum. The relative model path assumes that the current working directory is this repository.
+**`models/silero_vad.onnx` cannot be opened:** Run the pinned download command from the repository root and verify its checksum. The default path resolves relative to `voice_assistant.py`, so the launcher can be invoked from another working directory.
 
 **Connection refused on port 8081:** Start the persistent `whisper-server`, confirm it reports `127.0.0.1:8081`, and check that another process is not using the port.
 
-**LLM connection or model errors:** Confirm the configured machine is reachable, query `http://192.168.3.243:8080/v1/models`, and ensure its returned model ID accepts the `Qwen3-8B-Q5_K_M.gguf` value sent by the client. Change `LLM_URL` and `LLM_MODEL` together when using another backend.
+**LLM connection or model errors:** Confirm the configured machine is reachable, query `http://192.168.3.243:8080/v1/models`, and ensure its returned model ID accepts the `Qwen3-8B-Q5_K_M.gguf` value sent by the client. Change `VOICE_LLM_URL` and `VOICE_LLM_MODEL` together when using another backend.
 
 **No microphone or speaker is selected:** Run `--list-devices`, then pass a unique name fragment or numeric index with `--mic` and `--speaker`. Numeric indexes can change when USB or Bluetooth devices reconnect.
 

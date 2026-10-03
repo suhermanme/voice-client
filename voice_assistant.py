@@ -4,6 +4,7 @@ import argparse
 import io
 import json
 import math
+import os
 import queue
 import re
 import signal
@@ -11,6 +12,8 @@ import sys
 import threading
 import time
 import wave
+from dataclasses import dataclass
+from pathlib import Path
 
 import httpx
 import numpy as np
@@ -29,6 +32,10 @@ from PySide6.QtWidgets import QApplication, QWidget
 
 SAMPLE_RATE = 16000
 CHUNK = 512
+AUDIO_QUEUE_SECONDS = 2
+HTTP_TIMEOUT_SECONDS = 60.0
+
+PROJECT_DIR = Path(__file__).resolve().parent
 
 # Preferred audio devices.
 # Device indexes are intentionally NOT hard-coded because Core Audio indexes
@@ -47,7 +54,9 @@ WHISPER_URL = "http://127.0.0.1:8081/inference"
 LLM_URL = "http://192.168.3.243:8080/v1/chat/completions"
 
 # Models
-SILERO_MODEL = "models/silero_vad.onnx"
+SILERO_MODEL = str(
+    PROJECT_DIR / "models" / "silero_vad.onnx"
+)
 LLM_MODEL = "Qwen3-8B-Q5_K_M.gguf"
 
 # Supertonic
@@ -60,6 +69,79 @@ WINDOW_SIZE = 220
 # Conversation memory
 # 20 messages ~= 10 user/assistant exchanges.
 MAX_HISTORY_MESSAGES = 20
+
+
+@dataclass(frozen=True)
+class AppConfig:
+    whisper_url: str
+    llm_url: str
+    llm_model: str
+    llm_api_key: str | None
+    silero_model: str
+    vad_threshold: float
+    end_silence_ms: int
+    pre_roll_ms: int
+    min_speech_ms: int
+    http_timeout_seconds: float
+    max_history_messages: int
+    preferred_mic: str
+    preferred_speaker: str
+
+
+def positive_int(value):
+    value = int(value)
+
+    if value <= 0:
+        raise argparse.ArgumentTypeError(
+            "value must be greater than zero"
+        )
+
+    return value
+
+
+def positive_float(value):
+    value = float(value)
+
+    if value <= 0:
+        raise argparse.ArgumentTypeError(
+            "value must be greater than zero"
+        )
+
+    return value
+
+
+def history_limit(value):
+    value = positive_int(value)
+
+    if value < 2:
+        raise argparse.ArgumentTypeError(
+            "history must allow at least one user/assistant pair"
+        )
+
+    return value
+
+
+def probability(value):
+    value = float(value)
+
+    if not 0.0 <= value <= 1.0:
+        raise argparse.ArgumentTypeError(
+            "value must be between 0 and 1"
+        )
+
+    return value
+
+
+def milliseconds_to_chunks(milliseconds):
+    return max(
+        1,
+        math.ceil(
+            milliseconds
+            / 1000
+            * SAMPLE_RATE
+            / CHUNK
+        ),
+    )
 
 
 # ============================================================================
@@ -79,6 +161,7 @@ def parse_args():
 
     parser.add_argument(
         "--mic",
+        default=os.getenv("VOICE_MIC"),
         help=(
             "Microphone device name, partial name, or numeric device index. "
             "Example: --mic 'MacBook Pro Microphone'"
@@ -87,13 +170,139 @@ def parse_args():
 
     parser.add_argument(
         "--speaker",
+        default=os.getenv("VOICE_SPEAKER"),
         help=(
             "Speaker device name, partial name, or numeric device index. "
             "Example: --speaker 'MacBook Pro Speakers'"
         ),
     )
 
+    parser.add_argument(
+        "--whisper-url",
+        default=os.getenv(
+            "VOICE_WHISPER_URL",
+            WHISPER_URL,
+        ),
+        help="whisper-server inference URL.",
+    )
+
+    parser.add_argument(
+        "--llm-url",
+        default=os.getenv(
+            "VOICE_LLM_URL",
+            LLM_URL,
+        ),
+        help="OpenAI-compatible chat-completions URL.",
+    )
+
+    parser.add_argument(
+        "--llm-model",
+        default=os.getenv(
+            "VOICE_LLM_MODEL",
+            LLM_MODEL,
+        ),
+        help="Model ID sent to the LLM backend.",
+    )
+
+    parser.add_argument(
+        "--vad-model",
+        default=os.getenv(
+            "VOICE_VAD_MODEL",
+            SILERO_MODEL,
+        ),
+        help="Path to the Python Silero ONNX model.",
+    )
+
+    parser.add_argument(
+        "--vad-threshold",
+        type=probability,
+        default=os.getenv(
+            "VOICE_VAD_THRESHOLD",
+            str(VAD_THRESHOLD),
+        ),
+        help="Python live VAD probability threshold.",
+    )
+
+    parser.add_argument(
+        "--end-silence-ms",
+        type=positive_int,
+        default=os.getenv(
+            "VOICE_END_SILENCE_MS",
+            str(END_SILENCE_MS),
+        ),
+        help="Silence required to end an utterance.",
+    )
+
+    parser.add_argument(
+        "--pre-roll-ms",
+        type=positive_int,
+        default=os.getenv(
+            "VOICE_PRE_ROLL_MS",
+            str(PRE_ROLL_MS),
+        ),
+        help="Audio retained before speech detection.",
+    )
+
+    parser.add_argument(
+        "--min-speech-ms",
+        type=positive_int,
+        default=os.getenv(
+            "VOICE_MIN_SPEECH_MS",
+            str(MIN_SPEECH_MS),
+        ),
+        help="Minimum detected speech in an utterance.",
+    )
+
+    parser.add_argument(
+        "--http-timeout",
+        type=positive_float,
+        default=os.getenv(
+            "VOICE_HTTP_TIMEOUT",
+            str(HTTP_TIMEOUT_SECONDS),
+        ),
+        help="HTTP timeout in seconds.",
+    )
+
+    parser.add_argument(
+        "--max-history-messages",
+        type=history_limit,
+        default=os.getenv(
+            "VOICE_MAX_HISTORY_MESSAGES",
+            str(MAX_HISTORY_MESSAGES),
+        ),
+        help="Maximum user/assistant messages retained.",
+    )
+
     return parser.parse_args()
+
+
+def config_from_args(args):
+    return AppConfig(
+        whisper_url=args.whisper_url,
+        llm_url=args.llm_url,
+        llm_model=args.llm_model,
+        llm_api_key=(
+            os.getenv("VOICE_LLM_API_KEY")
+            or None
+        ),
+        silero_model=args.vad_model,
+        vad_threshold=args.vad_threshold,
+        end_silence_ms=args.end_silence_ms,
+        pre_roll_ms=args.pre_roll_ms,
+        min_speech_ms=args.min_speech_ms,
+        http_timeout_seconds=args.http_timeout,
+        max_history_messages=(
+            args.max_history_messages
+        ),
+        preferred_mic=os.getenv(
+            "VOICE_PREFERRED_MIC",
+            PREFERRED_MIC,
+        ),
+        preferred_speaker=os.getenv(
+            "VOICE_PREFERRED_SPEAKER",
+            PREFERRED_SPEAKER,
+        ),
+    )
 
 
 # ============================================================================
@@ -492,6 +701,12 @@ class ConversationHistory:
 
         self._trim()
 
+    def restore(self, messages):
+        self.messages = [
+            dict(message)
+            for message in messages
+        ]
+
     def _trim(self):
         while (
             len(self.messages) - 1
@@ -868,7 +1083,11 @@ def clear_audio_queue(
 # Whisper STT
 # ============================================================================
 
-def transcribe(samples):
+def transcribe(
+    client,
+    samples,
+    config,
+):
     audio = wav_bytes(
         samples
     )
@@ -877,8 +1096,8 @@ def transcribe(samples):
         time.perf_counter()
     )
 
-    response = httpx.post(
-        WHISPER_URL,
+    response = client.post(
+        config.whisper_url,
         files={
             "file": (
                 "utterance.wav",
@@ -892,7 +1111,6 @@ def transcribe(samples):
             "carry_initial_prompt": "true",
             "response_format": "json",
         },
-        timeout=60,
     )
 
     response.raise_for_status()
@@ -918,9 +1136,13 @@ def transcribe(samples):
 # Qwen LLM
 # ============================================================================
 
-def stream_llm(messages):
+def stream_llm(
+    client,
+    messages,
+    config,
+):
     payload = {
-        "model": LLM_MODEL,
+        "model": config.llm_model,
         "messages": messages,
         "temperature": 0.7,
         "top_p": 0.8,
@@ -937,11 +1159,18 @@ def stream_llm(messages):
 
     pieces = []
 
-    with httpx.stream(
+    headers = {}
+
+    if config.llm_api_key:
+        headers["Authorization"] = (
+            f"Bearer {config.llm_api_key}"
+        )
+
+    with client.stream(
         "POST",
-        LLM_URL,
+        config.llm_url,
         json=payload,
-        timeout=60,
+        headers=headers,
     ) as response:
         response.raise_for_status()
 
@@ -1559,6 +1788,7 @@ class VoiceAssistant:
         stop_event,
         mic_device,
         speaker_device,
+        config,
     ):
         self.signals = (
             signals
@@ -1576,15 +1806,30 @@ class VoiceAssistant:
             speaker_device
         )
 
+        self.config = config
+
+        queue_chunks = (
+            milliseconds_to_chunks(
+                AUDIO_QUEUE_SECONDS * 1000
+            )
+        )
+
         self.audio_queue = (
-            queue.Queue()
+            queue.Queue(
+                maxsize=queue_chunks
+            )
+        )
+
+        self.capture_enabled = (
+            threading.Event()
         )
 
         self.vad = SileroVAD(
-            SILERO_MODEL
+            self.config.silero_model
         )
 
         self.local_tts = None
+        self.http_client = None
 
         self.history = (
             ConversationHistory(
@@ -1592,7 +1837,8 @@ class VoiceAssistant:
                     SYSTEM_PROMPT
                 ),
                 max_messages=(
-                    MAX_HISTORY_MESSAGES
+                    self.config
+                    .max_history_messages
                 ),
             )
         )
@@ -1624,14 +1870,31 @@ class VoiceAssistant:
             )
 
         if (
-            not self
-            .stop_event
-            .is_set()
+            self.stop_event.is_set()
+            or not self.capture_enabled.is_set()
         ):
-            self.audio_queue.put(
-                indata[:, 0]
-                .copy()
+            return
+
+        chunk = indata[:, 0].copy()
+
+        try:
+            self.audio_queue.put_nowait(
+                chunk
             )
+
+        except queue.Full:
+            # Keep the newest audio if processing briefly falls behind.
+            try:
+                self.audio_queue.get_nowait()
+            except queue.Empty:
+                pass
+
+            try:
+                self.audio_queue.put_nowait(
+                    chunk
+                )
+            except queue.Full:
+                pass
 
     def run(self):
         try:
@@ -1645,6 +1908,11 @@ class VoiceAssistant:
             )
 
         finally:
+            self.capture_enabled.clear()
+
+            if self.http_client:
+                self.http_client.close()
+
             if self.local_tts:
                 self.local_tts.stop()
 
@@ -1661,40 +1929,29 @@ class VoiceAssistant:
             )
 
     def _run(self):
+        self.http_client = httpx.Client(
+            timeout=(
+                self.config
+                .http_timeout_seconds
+            )
+        )
+
         self.local_tts = (
             LocalTTS(
                 self.speaker_device
             )
         )
 
-        pre_roll_chunks = max(
-            1,
-            int(
-                PRE_ROLL_MS
-                / 1000
-                * SAMPLE_RATE
-                / CHUNK
-            ),
+        pre_roll_chunks = milliseconds_to_chunks(
+            self.config.pre_roll_ms
         )
 
-        silence_chunks_needed = max(
-            1,
-            int(
-                END_SILENCE_MS
-                / 1000
-                * SAMPLE_RATE
-                / CHUNK
-            ),
+        silence_chunks_needed = milliseconds_to_chunks(
+            self.config.end_silence_ms
         )
 
-        min_speech_chunks = max(
-            1,
-            int(
-                MIN_SPEECH_MS
-                / 1000
-                * SAMPLE_RATE
-                / CHUNK
-            ),
+        min_speech_chunks = milliseconds_to_chunks(
+            self.config.min_speech_ms
         )
 
         pre_roll = []
@@ -1712,7 +1969,7 @@ class VoiceAssistant:
         print(
             "Conversation memory: "
             f"up to approximately "
-            f"{MAX_HISTORY_MESSAGES // 2} "
+            f"{self.config.max_history_messages // 2} "
             "user/assistant exchanges."
         )
 
@@ -1723,6 +1980,8 @@ class VoiceAssistant:
         self.set_state(
             "LISTENING"
         )
+
+        self.capture_enabled.set()
 
         with sd.InputStream(
             samplerate=SAMPLE_RATE,
@@ -1772,7 +2031,7 @@ class VoiceAssistant:
 
                     if (
                         vad_probability
-                        >= VAD_THRESHOLD
+                        >= self.config.vad_threshold
                     ):
                         speaking = True
 
@@ -1806,7 +2065,7 @@ class VoiceAssistant:
 
                 if (
                     vad_probability
-                    >= VAD_THRESHOLD
+                    >= self.config.vad_threshold
                 ):
                     speech_chunks += 1
                     silence_chunks = 0
@@ -1823,6 +2082,8 @@ class VoiceAssistant:
                 # ============================================================
                 # End of utterance
                 # ============================================================
+
+                self.capture_enabled.clear()
 
                 if (
                     speech_chunks
@@ -1859,7 +2120,9 @@ class VoiceAssistant:
                             user_text,
                             stt_time,
                         ) = transcribe(
-                            samples
+                            self.http_client,
+                            samples,
+                            self.config,
                         )
 
                     except Exception as exc:
@@ -1892,6 +2155,10 @@ class VoiceAssistant:
                         # Conversation memory
                         # ----------------------------------------------------
 
+                        history_before_user = (
+                            self.history.get_messages()
+                        )
+
                         self.history.add_user(
                             user_text
                         )
@@ -1913,8 +2180,10 @@ class VoiceAssistant:
                                 first_token_at,
                                 llm_total,
                             ) = stream_llm(
+                                self.http_client,
                                 self.history
-                                .get_messages()
+                                .get_messages(),
+                                self.config,
                             )
 
                         except Exception as exc:
@@ -2070,6 +2339,10 @@ class VoiceAssistant:
                                 )
 
                         else:
+                            self.history.restore(
+                                history_before_user
+                            )
+
                             print(
                                 "No LLM response."
                             )
@@ -2105,6 +2378,9 @@ class VoiceAssistant:
                 utterance = []
                 pre_roll = []
 
+                if not self.stop_event.is_set():
+                    self.capture_enabled.set()
+
         print(
             "\nVoice loop stopped."
         )
@@ -2116,6 +2392,9 @@ class VoiceAssistant:
 
 def main():
     args = parse_args()
+    config = config_from_args(
+        args
+    )
 
     # ------------------------------------------------------------------------
     # Device listing mode
@@ -2133,7 +2412,7 @@ def main():
         mic_device = (
             choose_audio_device(
                 args.mic,
-                PREFERRED_MIC,
+                config.preferred_mic,
                 input_device=True,
             )
         )
@@ -2141,7 +2420,7 @@ def main():
         speaker_device = (
             choose_audio_device(
                 args.speaker,
-                PREFERRED_SPEAKER,
+                config.preferred_speaker,
                 output_device=True,
             )
         )
@@ -2251,6 +2530,7 @@ def main():
             stop_event,
             mic_device,
             speaker_device,
+            config,
         )
     )
 
