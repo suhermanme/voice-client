@@ -1,0 +1,56 @@
+# Python bytecode, test, type-checker, and tool caches
+__pycache__/
+*.py[cod]
+*$py.class
+.cache/
+.coverage
+.coverage.*
+.hypothesis/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Virtual environments and local environment/secrets
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Packaging and build output
+build/
+dist/
+wheels/
+*.egg-info/
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Models and other large inference artifacts
+models/
+*.bin
+*.gguf
+*.onnx
+*.ort
+*.safetensors
+*.pt
+*.pth
+
+# Generated audio and media
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.m4a
+
+# Runtime output and logs
+*.log
+*.ses
+tmp/
+temp/
