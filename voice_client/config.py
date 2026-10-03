@@ -31,6 +31,8 @@ TTS_VOICE = "F1"
 TTS_SAMPLE_RATE = 44100
 WINDOW_SIZE = 220
 MAX_HISTORY_MESSAGES = 20
+UI_STYLE = "orb"
+UI_STYLES = ("orb", "circular-wave", "spectrum-pill")
 
 
 @dataclass(frozen=True)
@@ -48,6 +50,7 @@ class AppConfig:
     max_history_messages: int
     preferred_mic: str
     preferred_speaker: str
+    ui_style: str
 
 
 def positive_int(value):
@@ -169,6 +172,12 @@ def parse_args(argv=None):
         default=os.getenv("VOICE_LOG_LEVEL", "INFO").upper(),
         help="Runtime logging level.",
     )
+    parser.add_argument(
+        "--ui-style",
+        choices=UI_STYLES,
+        default=os.getenv("VOICE_UI_STYLE", UI_STYLE).lower(),
+        help="Floating status visualization.",
+    )
     return parser.parse_args(argv)
 
 
@@ -189,4 +198,5 @@ def config_from_args(args):
         preferred_speaker=os.getenv(
             "VOICE_PREFERRED_SPEAKER", PREFERRED_SPEAKER
         ),
+        ui_style=args.ui_style,
     )

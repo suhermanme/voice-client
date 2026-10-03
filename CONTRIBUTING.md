@@ -15,7 +15,7 @@ Model files are intentionally excluded from Git. Follow the pinned model downloa
 ## Make a change
 
 - Keep runtime defaults and CLI parsing in `voice_client/config.py`.
-- Keep orb presentation and Qt signal definitions in `voice_client/ui.py`.
+- Keep status visualization and Qt signal definitions in `voice_client/ui.py`.
 - Keep orchestration and the canonical `main()` entry point in `voice_assistant.py`.
 - Preserve compatibility with OpenAI-compatible LLM services and the HTTP interface shared by Metal, CUDA, Vulkan, and CPU whisper.cpp builds.
 - Add behavior-focused tests for fixes that can regress without real audio hardware or model services.

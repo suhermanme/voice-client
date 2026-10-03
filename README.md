@@ -1,6 +1,6 @@
 # Local bilingual voice assistant
 
-A local, continuously listening Indonesian/English voice assistant with automatic endpoint detection, HTTP speech recognition, a streaming OpenAI-compatible language-model backend, local text-to-speech, and a floating PySide6 status orb.
+A local, continuously listening Indonesian/English voice assistant with automatic endpoint detection, HTTP speech recognition, a streaming OpenAI-compatible language-model backend, local text-to-speech, and a selectable floating PySide6 status visualization.
 
 [`voice_assistant.py`](voice_assistant.py) is the canonical application and launcher. The Python client is independent of the hardware backend used by `whisper-server`: Metal, CUDA, Vulkan, and CPU builds expose the same HTTP API, so changing the whisper.cpp build does not require changes to the application.
 
@@ -10,7 +10,7 @@ The source is split by responsibility while keeping that launch contract:
 | --- | --- |
 | `voice_assistant.py` | Audio devices, VAD and inference orchestration, conversation flow, and canonical `main()` |
 | `voice_client/config.py` | Proven defaults, environment variables, CLI validation, and immutable runtime configuration |
-| `voice_client/ui.py` | PySide6 signals, orb states, painting, dragging, and close behavior |
+| `voice_client/ui.py` | PySide6 signals, selectable visual styles, state painting, dragging, and close behavior |
 | `tests/test_voice_assistant.py` | Hardware-free regression tests using mocked audio and HTTP transports |
 
 ## Architecture
@@ -21,7 +21,7 @@ microphone -> Python Silero VAD -> utterance WAV in memory
            -> OpenAI-compatible chat-completions server (LLM)
            -> complete tagged sentences -> Supertonic (local TTS) -> speaker
 
-                         PySide6 floating orb
+                    PySide6 floating status visualization
              listening / hearing / thinking / speaking / error
 ```
 
@@ -217,7 +217,7 @@ Start the STT and LLM servers first, then run the canonical launcher from the re
 uv run python voice_assistant.py
 ```
 
-Before opening the microphone, the launcher verifies the Python VAD model file, input and output audio formats, `whisper-server` health, and the configured model reported by the LLM backend's `/v1/models` route. A failed check is logged and leaves the orb red so the cause is visible. Closing the orb or pressing Ctrl-C signals active work to stop, closes the persistent HTTP client, stops audio playback, and waits briefly for the worker to exit.
+Before opening the microphone, the launcher verifies the Python VAD model file, input and output audio formats, `whisper-server` health, and the configured model reported by the LLM backend's `/v1/models` route. A failed check is logged and leaves the visualization red so the cause is visible. Closing the visualization or pressing Ctrl-C signals active work to stop, closes the persistent HTTP client, stops audio playback, and waits briefly for the worker to exit.
 
 On macOS, grant microphone access to the terminal application when prompted.
 
@@ -251,6 +251,7 @@ CLI arguments take precedence over environment-backed defaults. The main setting
 | `VOICE_HTTP_TIMEOUT` | `--http-timeout` | `60` seconds |
 | `VOICE_MAX_HISTORY_MESSAGES` | `--max-history-messages` | `20` |
 | `VOICE_LOG_LEVEL` | `--log-level` | `INFO` |
+| `VOICE_UI_STYLE` | `--ui-style` | `orb` |
 | `VOICE_MIC` | `--mic` | Preferred device, then system default |
 | `VOICE_SPEAKER` | `--speaker` | Preferred device, then system default |
 
@@ -264,7 +265,29 @@ VOICE_LLM_MODEL=my-local-model \
 uv run python voice_assistant.py
 ```
 
-## Orb states and interaction
+## UI styles, states, and interaction
+
+Three styles use the same state colors and require only PySide6 Essentials:
+
+| Style | Behavior |
+| --- | --- |
+| `orb` | Default softly pulsing filled sphere |
+| `circular-wave` | Expanding, fading rings around a smaller center; rings contract while thinking |
+| `spectrum-pill` | Compact state label with animated bars; live microphone level drives the bars while hearing |
+
+Select a style for one run:
+
+```bash
+uv run python voice_assistant.py --ui-style circular-wave
+uv run python voice_assistant.py --ui-style spectrum-pill
+```
+
+Or make it the local default:
+
+```bash
+export VOICE_UI_STYLE=spectrum-pill
+uv run python voice_assistant.py
+```
 
 | State | Meaning |
 | --- | --- |
@@ -275,7 +298,7 @@ uv run python voice_assistant.py
 | `SPEAKING` | Playing synthesized audio |
 | `ERROR` | Startup, STT, LLM, or TTS failed; inspect the terminal log |
 
-The orb stays above other windows and can be dragged. Close it or press Ctrl-C in the terminal for a clean shutdown.
+The visualization stays above other windows and can be dragged. On Wayland it uses the compositor's native system-move operation. Close it or press Ctrl-C in the terminal for a clean shutdown.
 
 ## Conversation memory
 
@@ -332,7 +355,7 @@ This project is open source under the [MIT License](LICENSE).
 
 **LLM connection or model errors:** Confirm the configured machine is reachable, query `http://192.168.3.243:8080/v1/models`, and ensure its returned model ID accepts the `Qwen3-8B-Q5_K_M.gguf` value sent by the client. Change `VOICE_LLM_URL` and `VOICE_LLM_MODEL` together when using another backend.
 
-**The orb remains red:** Read the timestamped terminal error and traceback. At startup this usually identifies a missing VAD file, unsupported audio format, unhealthy Whisper server, unreachable LLM server, or a configured model absent from `/v1/models`. During operation it indicates an STT, LLM, or TTS failure; speaking again retries transient request failures.
+**The visualization remains red:** Read the timestamped terminal error and traceback. At startup this usually identifies a missing VAD file, unsupported audio format, unhealthy Whisper server, unreachable LLM server, or a configured model absent from `/v1/models`. During operation it indicates an STT, LLM, or TTS failure; speaking again retries transient request failures.
 
 **No microphone or speaker is selected:** Run `--list-devices`, then pass a unique name fragment or numeric index with `--mic` and `--speaker`. Numeric indexes can change when USB or Bluetooth devices reconnect.
 

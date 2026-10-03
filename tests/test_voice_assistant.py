@@ -4,11 +4,12 @@ import queue
 import tempfile
 import threading
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import httpx
 import numpy as np
 
+from voice_client.config import parse_args
 from voice_assistant import (
     AppConfig,
     CHUNK,
@@ -40,6 +41,7 @@ def test_config(**overrides):
         "max_history_messages": 20,
         "preferred_mic": "mic",
         "preferred_speaker": "speaker",
+        "ui_style": "orb",
     }
     values.update(overrides)
     return AppConfig(**values)
@@ -61,6 +63,12 @@ class DurationConversionTests(unittest.TestCase):
             argparse.ArgumentTypeError
         ):
             history_limit(1)
+
+    def test_ui_style_can_be_selected_from_cli(self):
+        for style in ("circular-wave", "spectrum-pill"):
+            with self.subTest(style=style):
+                args = parse_args(["--ui-style", style])
+                self.assertEqual(args.ui_style, style)
 
 
 class ConversationHistoryTests(unittest.TestCase):
@@ -95,6 +103,7 @@ class AudioQueueTests(unittest.TestCase):
         )
         assistant.stop_event = threading.Event()
         assistant.capture_enabled = threading.Event()
+        assistant.signals = Mock()
         assistant.audio_queue = queue.Queue(
             maxsize=1
         )
@@ -144,6 +153,7 @@ class AudioQueueTests(unittest.TestCase):
             assistant.audio_queue.get_nowait(),
             new_chunk[:, 0],
         )
+        assistant.signals.audio_level_changed.emit.assert_called()
 
 
 class AudioDeviceSelectionTests(unittest.TestCase):

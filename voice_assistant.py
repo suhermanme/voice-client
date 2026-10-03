@@ -29,7 +29,6 @@ from voice_client.config import (
     SAMPLE_RATE,
     TTS_SAMPLE_RATE,
     TTS_VOICE,
-    WINDOW_SIZE,
     AppConfig,
     config_from_args,
     history_limit,
@@ -1536,6 +1535,12 @@ class VoiceAssistant:
 
         chunk = indata[:, 0].copy()
 
+        level = min(
+            1.0,
+            float(np.sqrt(np.mean(np.square(chunk)))) * 12.0,
+        )
+        self.signals.audio_level_changed.emit(level)
+
         try:
             self.audio_queue.put_nowait(
                 chunk
@@ -1737,7 +1742,7 @@ class VoiceAssistant:
         speech_chunks = 0
 
         LOGGER.info(
-            "Listening continuously; Ctrl-C or close the orb to quit"
+            "Listening continuously; Ctrl-C or close the status window to quit"
         )
 
         LOGGER.info(
@@ -2213,12 +2218,13 @@ def main():
     )
 
     # ------------------------------------------------------------------------
-    # Orb
+    # Status visualization
     # ------------------------------------------------------------------------
 
     orb = Orb(
         signals,
         stop_event,
+        style=config.ui_style,
     )
 
     screen = (
@@ -2229,7 +2235,7 @@ def main():
 
     x = (
         screen.right()
-        - WINDOW_SIZE
+        - orb.width()
         - 40
     )
 
