@@ -272,7 +272,7 @@ Three styles use the same state colors and require only PySide6 Essentials:
 | Style | Behavior |
 | --- | --- |
 | `orb` | Default softly pulsing filled sphere |
-| `circular-wave` | Expanding, fading rings around a smaller center; rings contract while thinking |
+| `circular-wave` | Overlapping cyan, violet, and magenta audio waveforms wrapped around a dark central disk |
 | `spectrum-pill` | Compact state label with animated bars; live microphone level drives the bars while hearing |
 
 Select a style for one run:

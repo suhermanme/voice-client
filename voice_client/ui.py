@@ -3,8 +3,14 @@
 import logging
 import math
 
-from PySide6.QtCore import QObject, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QPainter, QPen, QRadialGradient
+from PySide6.QtCore import QObject, QPointF, Qt, QTimer, Signal
+from PySide6.QtGui import (
+    QColor,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QRadialGradient,
+)
 from PySide6.QtWidgets import QWidget
 
 from .config import UI_STYLES, WINDOW_SIZE
@@ -88,7 +94,7 @@ class Orb(QWidget):
         if self.style == "spectrum-pill":
             self._paint_spectrum_pill(painter, color, rgb)
         elif self.style == "circular-wave":
-            self._paint_circular_wave(painter, cx, cy, color, rgb)
+            self._paint_circular_wave(painter, cx, cy)
         else:
             self._paint_orb(painter, cx, cy, color, rgb, base_radius)
 
@@ -143,65 +149,28 @@ class Orb(QWidget):
             int(radius * 2),
         )
 
-    def _paint_circular_wave(self, painter, cx, cy, color, rgb):
-        pulse = (math.sin(self.phase * 1.4) + 1.0) / 2.0
-        core_radius = 22 + pulse * 4
-
-        ring_count = 1 if self.state == "IDLE" else 3
-        for index in range(ring_count):
-            progress = (
-                self.phase / (math.pi * 2)
-                + index / ring_count
-            ) % 1.0
-
-            if self.state == "THINKING":
-                progress = 1.0 - progress
-
-            radius = core_radius + 12 + progress * 62
-            alpha = int((1.0 - progress) ** 1.5 * 175)
-            if self.state == "IDLE":
-                alpha = min(alpha, 70)
-
-            width = 1.5 + (1.0 - progress) * 2.5
-            painter.setBrush(Qt.NoBrush)
-            painter.setPen(QPen(QColor(*rgb, alpha), width))
-            painter.drawEllipse(
-                int(cx - radius),
-                int(cy - radius),
-                int(radius * 2),
-                int(radius * 2),
-            )
-
-        glow_radius = core_radius * 2.1
-        glow = QRadialGradient(cx, cy, glow_radius)
-        glow.setColorAt(0.0, QColor(*rgb, 220))
-        glow.setColorAt(0.45, QColor(*rgb, 110))
-        glow.setColorAt(1.0, QColor(*rgb, 0))
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(glow)
-        painter.drawEllipse(
-            int(cx - glow_radius),
-            int(cy - glow_radius),
-            int(glow_radius * 2),
-            int(glow_radius * 2),
-        )
+    def _paint_circular_wave(self, painter, cx, cy):
+        level_by_state = {
+            "IDLE": 2.5,
+            "LISTENING": 5.0,
+            "HEARING": 6.0 + self.audio_level * 11.0,
+            "THINKING": 8.0,
+            "SPEAKING": 12.0,
+            "ERROR": 3.5,
+        }
+        amplitude = level_by_state[self.state]
+        pulse = (math.sin(self.phase * 1.6) + 1.0) / 2.0
+        core_radius = 65 + pulse * 2
 
         core = QRadialGradient(
-            cx - core_radius * 0.25,
-            cy - core_radius * 0.30,
-            core_radius * 1.4,
+            cx - core_radius * 0.22,
+            cy - core_radius * 0.25,
+            core_radius * 1.3,
         )
-        core.setColorAt(0.0, QColor(255, 255, 255, 245))
-        core.setColorAt(
-            0.30,
-            QColor(
-                min(color.red() + 75, 255),
-                min(color.green() + 75, 255),
-                min(color.blue() + 75, 255),
-                245,
-            ),
-        )
-        core.setColorAt(1.0, color)
+        core.setColorAt(0.0, QColor(70, 17, 105, 235))
+        core.setColorAt(0.55, QColor(36, 7, 67, 238))
+        core.setColorAt(1.0, QColor(8, 3, 22, 245))
+        painter.setPen(Qt.NoPen)
         painter.setBrush(core)
         painter.drawEllipse(
             int(cx - core_radius),
@@ -209,6 +178,72 @@ class Orb(QWidget):
             int(core_radius * 2),
             int(core_radius * 2),
         )
+
+        if self.state == "ERROR":
+            palette = (
+                QColor(255, 58, 92),
+                QColor(255, 126, 48),
+                QColor(255, 54, 180),
+            )
+        else:
+            palette = (
+                QColor(20, 245, 232),
+                QColor(220, 38, 255),
+                QColor(91, 104, 255),
+            )
+
+        paths = []
+        point_count = 240
+        base_radius = 69
+
+        for layer in range(3):
+            path = QPainterPath()
+            lobes = 5 + layer
+            layer_phase = self.phase * (1.05 + layer * 0.14)
+
+            for point in range(point_count + 1):
+                angle = point / point_count * math.tau
+                wave = (
+                    math.sin(lobes * angle + layer_phase) * 0.72
+                    + math.sin(
+                        (lobes + 3) * angle
+                        - layer_phase * 0.63
+                    )
+                    * 0.28
+                )
+                radius = base_radius + amplitude * wave
+                position = QPointF(
+                    cx + math.cos(angle) * radius,
+                    cy + math.sin(angle) * radius,
+                )
+
+                if point == 0:
+                    path.moveTo(position)
+                else:
+                    path.lineTo(position)
+
+            path.closeSubpath()
+            paths.append(path)
+
+        painter.setBrush(Qt.NoBrush)
+        painter.setCompositionMode(QPainter.CompositionMode_Plus)
+
+        for path, wave_color in zip(paths, palette):
+            glow_color = QColor(wave_color)
+            glow_color.setAlpha(38)
+            glow_pen = QPen(glow_color, 9)
+            glow_pen.setJoinStyle(Qt.RoundJoin)
+            painter.setPen(glow_pen)
+            painter.drawPath(path)
+
+            line_color = QColor(wave_color)
+            line_color.setAlpha(220)
+            line_pen = QPen(line_color, 1.8)
+            line_pen.setJoinStyle(Qt.RoundJoin)
+            painter.setPen(line_pen)
+            painter.drawPath(path)
+
+        painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
 
     def _paint_spectrum_pill(self, painter, color, rgb):
         painter.setPen(QPen(QColor(*rgb, 90), 1.5))

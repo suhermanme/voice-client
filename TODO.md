@@ -17,7 +17,7 @@ This roadmap tracks the code-review findings for the canonical `voice_assistant.
 - [x] Expand behavior-focused tests for device selection, language parsing, startup model validation, HTTP/SSE handling, cancellation, TTS state transitions, and conversation recovery.
 - [x] Add contribution guidance and structured GitHub bug/feature issue forms.
 - [x] Publish the project under the MIT License selected by the project owner.
-- [x] Add configurable `orb` and `circular-wave` status styles, including native compositor dragging for Wayland.
+- [x] Add configurable `orb` and radial audio-wave status styles, including native compositor dragging for Wayland.
 - [x] Add a compact `spectrum-pill` style with state labels, animated bars, and live microphone-level response.
 - [x] Reduce the Qt installation to PySide6 Essentials because the UI only uses Qt Core, Gui, and Widgets.
 
